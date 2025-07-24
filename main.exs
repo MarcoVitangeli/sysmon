@@ -1,32 +1,30 @@
-"""
-What we want to do is to create a supervision tree of the following
-structure:
-{
-  Root: {
-    Container Monitor: [ContainerMonitor]
-  }
-}
-
-we need to find the files to monitor in:
-/sys/fs/cgroup/system.slice/docker-{guid}.scope
-"""
-
-defmodule Sysmon.ContainerMonitorSupervisor do
-  use Supervisor
-  require Logger
-
+defmodule Sysmon.DockerUtils do
   @cgroup_dir "/sys/fs/cgroup/system.slice/"
   @docker_dir_regex ~r/^docker-([a-f0-9]{64})\.scope$/
+
+  def cgroup_dir do
+    @cgroup_dir
+  end
+
+  def filter_container_dirs(dir) when is_binary(dir) do
+    Regex.match?(@docker_dir_regex, dir)
+  end
+end
+
+defmodule Sysmon.ContainerMonitorSupervisor do
+  alias Sysmon.DockerUtils
+  use Supervisor
+  require Logger
 
   def start_link() do
     Supervisor.start_link(__MODULE__, nil, name: __MODULE__)
   end
 
   def init(_) do
-    {:ok, entries} = File.ls(@cgroup_dir)
-    valid_entries = entries |> Enum.filter(fn dir -> Regex.match?(@docker_dir_regex, dir) end)
+    {:ok, entries} = File.ls(DockerUtils.cgroup_dir)
+    valid_entries = entries |> Enum.filter(&DockerUtils.filter_container_dirs/1)
 
-    children = [ {Sysmon.ProcessMonitor, @cgroup_dir} | valid_entries |> Enum.map(fn x -> get_cpu_monitor(x) end)]
+    children = [ Sysmon.ProcessMonitor | valid_entries |> Enum.map(fn x -> get_container_monitor(x) end)]
 
     opts = [
       strategy: :one_for_one,
@@ -36,79 +34,75 @@ defmodule Sysmon.ContainerMonitorSupervisor do
     Supervisor.init(children, opts)
   end
 
-  def start_metric_emit() do
-    handles = Supervisor.which_children(Sysmon.ContainerMonitorSupervisor)
-    |> Enum.filter(fn {id, _, _, _} ->
-        case id do
-          {:sysmon_cpu_worker, _} -> true
-          _ -> false
-        end
-    end)
-    |> Enum.map(fn {_, pid, _, _} -> pid end)
-    |> Enum.map(fn pid -> :timer.send_interval(2000, pid, :emit) end)
-    |> Enum.map(fn {:ok, handle} -> handle end)
-
-    {:ok, handles}
-  end
-
-  def cancel_metric_emit(handles) do
-    handles |> Enum.map(fn e -> :timer.cancel(e) end)
-  end
-  
-  defp get_cpu_monitor(dir) when is_binary(dir) do
+  defp get_container_monitor(dir) when is_binary(dir) do
     %{
-      id: {:sysmon_cpu_worker, dir},
-      start: {Sysmon.ContainerMonitor, :start_link, [Path.join(@cgroup_dir, dir)]}
+      id: {:sysmon_container_monitor, dir},
+      start: {Sysmon.ContainerMonitor, :start_link, [Path.join(DockerUtils.cgroup_dir, dir)]}
     }
   end
 end
 
 defmodule Sysmon.ProcessMonitor do
+  alias Sysmon.DockerUtils
   use GenServer
   require Logger
 
-  def start_link(cgroup_dir) when is_binary(cgroup_dir) do
-    GenServer.start_link(__MODULE__, cgroup_dir, name: __MODULE__)
+  def start_link(_) do
+    GenServer.start_link(__MODULE__, nil, name: __MODULE__)
   end
   
-  def init(init_arg) do
-    Process.send_after(self(), :monitor, 1000)
-    {:ok, init_arg}
+  def init(_) do
+    :timer.send_interval(2000, self(), :monitor)
+    {:ok, nil}
   end
 
-  def handle_info(:monitor, cgroup_dir) do
+  def handle_info(:monitor, _) do
     existing_dirs = Supervisor.which_children(Sysmon.ContainerMonitorSupervisor)
       |> Enum.filter(fn {id, _, _, _} -> 
         case id do
-          {:sysmon_cpu_worker, _} -> true
+          {:sysmon_container_monitor, _} -> true
           _ -> false
         end
       end)
-      |> Enum.map(fn {{:sysmon_cpu_worker, dir}, _, :worker, [Sysmon.ContainerMonitor]} -> dir end)
+      |> Enum.map(fn {{:sysmon_container_monitor, dir}, _, :worker, [Sysmon.ContainerMonitor]} -> dir end)
 
-    case File.ls(cgroup_dir) do
-      {:ok, entries} -> check_entries(cgroup_dir, entries, existing_dirs)
+    case File.ls(DockerUtils.cgroup_dir) do
+      {:ok, entries} -> check_entries(entries |> Enum.filter(&DockerUtils.filter_container_dirs/1), existing_dirs)
       {:error, _} -> Logger.info("ERROR reading cgroup file")
     end
 
-    Process.send_after(self(), :monitor, 1500)
-    {:noreply, cgroup_dir}
+    {:noreply, nil}
   end
 
-  def check_entries(cgroup_dir, entries, existing_dirs) do
+  def check_entries(entries, existing_dirs) do
     Logger.info("Start child check removal")
     entry_set = entries |> MapSet.new
-
-    existing_dirs 
+    dir_set = existing_dirs |> MapSet.new
+  
+    existing_dirs # first, we remove from the Supervisor any child that does not appear in cgroup directory
     |> Enum.filter(fn dir -> !MapSet.member?(entry_set, dir) end)
-    |> Enum.map(fn dir -> remove_non_existent(dir) end)
+    |> Enum.map(fn dir -> remove_terminated_container(dir) end)
+
+    entries # second, we add any missing children that we did not track
+    |> Enum.filter(fn dir -> !MapSet.member?(dir_set, dir) end)
+    |> Enum.map(&add_missing_container/1)
+
     Logger.info("End child check removal")
   end
 
-  def remove_non_existent(dir) do
+  def remove_terminated_container(dir) do
     Logger.info("Deleting child " <> dir)
-    :ok = Supervisor.terminate_child(Sysmon.ContainerMonitorSupervisor, {:sysmon_cpu_worker, dir})
-    :ok = Supervisor.delete_child(Sysmon.ContainerMonitorSupervisor, {:sysmon_cpu_worker, dir})
+    :ok = Supervisor.terminate_child(Sysmon.ContainerMonitorSupervisor, {:sysmon_container_monitor, dir})
+    :ok = Supervisor.delete_child(Sysmon.ContainerMonitorSupervisor, {:sysmon_container_monitor, dir})
+  end
+
+  def add_missing_container(dir) do
+    Logger.info("Adding new child " <> dir)
+    child_spec = %{
+      id: {:sysmon_container_monitor, dir},
+      start: {Sysmon.ContainerMonitor, :start_link, [Path.join(DockerUtils.cgroup_dir, dir)]}
+    }
+    Supervisor.start_child(Sysmon.ContainerMonitorSupervisor, child_spec)
   end
 end
 
@@ -122,6 +116,7 @@ defmodule Sysmon.ContainerMonitor do
 
   def init(path) when is_binary(path) do
     Logger.info("STARTING TO MONITOR " <> path)
+    :timer.send_interval(2000, self(), :emit)
     {:ok, path} # maybe more state to come
   end
 
@@ -158,8 +153,6 @@ end
 defmodule Sysmon.Main do
   def main() do
     {:ok, _} = Sysmon.ContainerMonitorSupervisor.start_link()
-    {:ok, handles} = Sysmon.ContainerMonitorSupervisor.start_metric_emit()
-
     Process.sleep(:infinity)
   end
 end
