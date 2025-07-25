@@ -12,6 +12,8 @@ In order to keep the state in sync, there is a process called `Sysmon.ProcessMon
 - new container started, in that case a new process to monitor it will be spawn
 - container no longer existing, in that case the process monitor will terminate the container associated process
 
+Both the process monitor and the container monitor use the `:timer` module in erlang in order to periodically execute its checks.
+
 ## Sysmon API
 
 **sysmon_api** contains the API that **sysmon** uses to publish metrics. It's a simple Elixir Phoenix API with basic CRUD capabilities, plus a `"/batch"` endpoint to publish multiple metrics at once. It serves as a layer between the monitor and the DB, but could be further expanded.
