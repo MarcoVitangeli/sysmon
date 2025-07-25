@@ -3,6 +3,8 @@
 This project is part of my journey getting started with Elixir. It contains two mix-based projects:
 
 ## Sysmon
+<img width="1298" height="1094" alt="image" src="https://github.com/user-attachments/assets/0732cd74-a964-40c6-a7d2-71447c5ea931" />
+
 
 **sysmon** contains the logic of the monitor. It will spawn a new elixir process per active docker container in the system. This process will send data to a buffer process (`Sysmon.Emit.EventEmitter`) and once the buffer is full, it will publish the gathered metrics and send them the **sysmon_api**. The metrics gathered by **sysmon** at the moment are CPU metrics (more to come).
 In order to keep the state in sync, there is a process called `Sysmon.ProcessMonitor` which will keep track of:
